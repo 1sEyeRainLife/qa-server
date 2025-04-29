@@ -30,11 +30,23 @@ Path(UPLOAD_DIR).mkdir(exist_ok=True)
 class Question(BaseModel):
     text: str
 
+class Knownledge(BaseModel):
+    feedback_id: str
+    user_id: str
+    content: str
+    rating: int
+    timestamp: str
+
 @app.post("/api/answers")
 async def gen_answers(question: Question):
 
     answer = qa_agent.ask(question.text)
     return {"message": answer}
+
+@app.post("/api/qa_knownledge1")
+async def create_knownledge(knownledge: Knownledge):
+    qa_agent.add_feedback(knownledge)
+    return {"ok": True}
 
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile = File(...)):
