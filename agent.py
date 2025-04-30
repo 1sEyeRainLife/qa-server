@@ -1,9 +1,12 @@
 import os
 import hashlib
+import numpy as np
+import jieba
+import jieba.posseg as pseg
 from typing import Dict
 from dotenv import load_dotenv
 from datetime import datetime
-from pymilvus import utility, connections, Collection
+from pymilvus import utility, connections, Collection, DataType
 from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import FAISS, Milvus
@@ -17,10 +20,16 @@ from models import schema as collection_schema
 load_dotenv()
 
 # 自定义提示词模板
-QA_PROMPT_TEMPLATE = """请根据以下上下文信息回答问题。如果无法从上下文中得到答案，请回答“我不知道”。
+QA_PROMPT_TEMPLATE = """你是一位专业的技术文档分析师，请根据上下文和你的知识回答问题：
+1. 如果上下文直接包含答案，引用原文回答
+2. 如果上下文相关但不完整，结合知识补充回答
+3. 确实无关时再说"我不知道"
+
 上下文：{context}
 问题：{question}
-答案："""
+关键词：{keywords}  # 显式提示LLM关注这些词
+答案（简洁中文）：
+"""
 # 提示词优化技巧
 # 在提示词中指定AI的角色，例如： 你是以为技术文档专家，请回答与i下问题。。。
 # 明确输出的格式，如列表，json等
@@ -56,10 +65,14 @@ class PDFQAAgent:
         self.vectorstore = None
         self.qa = None
         self.qa_chains: Dict[str, RetrievalQA] = {}
-        self.current_collection = "qa_knownledge3"
+        self.current_collection = "qa_knownledge4"
         if self.persist_db:
             self._init_milvus_connection()
             self._load_existing_collections()
+    
+    def _extrace_keywords(self, text):
+        words = pseg.cut(text)
+        return [word for word, flag in words if flag in ['n', 'nr', 'ns']]  # 提取名词
     
     def _init_milvus_connection(self):
         try:
@@ -85,7 +98,7 @@ class PDFQAAgent:
     def _load_existing_collections(self):
         if utility.has_collection(self.current_collection) and self.persist_db:
             print(f"加载已有集合: {self.current_collection}")
-            vectorstore = Milvus(
+            self.vectorstore = Milvus(
                 embedding_function=self.embeddings,
                 collection_name=self.current_collection,
                 connection_args={"host": "127.0.0.1", "port": "19530"}
@@ -93,7 +106,7 @@ class PDFQAAgent:
             self.qa = RetrievalQA.from_chain_type(
                 llm=self.llm,
                 chain_type="stuff",
-                retriever=vectorstore.as_retriever(),
+                retriever=self.vectorstore.as_retriever(),
                 memory=ConversationBufferWindowMemory(
                     k=5,
                     memory_key="history",
@@ -126,43 +139,62 @@ class PDFQAAgent:
         #     self.current_collection = col_name
     
     def load_pdf(self, pdf_path, merge_to_existing=True):
+        print("准备加载pdf")
         loader = PyPDFLoader(pdf_path)
-        pages = loader.load()[:10]
+        pages = loader.load()
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len)
         texts = text_splitter.split_documents(pages)
 
+        print(f"切分完成...共计{len(texts)}")
         collection = Collection(self.current_collection)
         collection.load()
 
-        ids = []
-        embeddings = []
-        contents = []
-        sources = []
+        batch_size = 50
+        print(f"开始分批写入。。。每批100，需{len(texts)// batch_size}轮")
+        for batch_start in range(0, len(texts), batch_size):
+            batch_end = min(batch_start+batch_size, len(texts))
+            batch_texts = texts[batch_start:batch_end]
+            # 准备数据
+            data = {
+                "ids": [],
+                "embeddings": [],
+                "sources": [],
+                "user_ids": [],
+                "ratings": [],
+                "timestamps": [],
+                "contents": []
+            }
+            for i, text in enumerate(batch_texts):
+                data["ids"].append(f"pdf_{hashlib.md5(pdf_path.encode()).hexdigest()}_{i}")
+                data["embeddings"].append(self.embeddings.embed_query(text.page_content))
+                data["sources"].append("pdf")
+                data["user_ids"].append("")
+                data["ratings"].append(0)
+                data["timestamps"].append("")
+                data["contents"].append(text.page_content)
+            # 验证
+            n_rows = len(data["ids"])
+            assert all(len(lst) == n_rows for lst in data.values()), "字段行数不一致！"
+            print(f"准备插入 {n_rows} 行数据，向量维度: {len(data['embeddings'][0])}")
 
-        for i, text in enumerate(texts):
-            doc_id = hashlib.md5(f"{pdf_path}_{i}".encode()).hexdigest()
-            ids.append(doc_id)
-
-            embedding = self.embeddings.embed_query(text.page_content)
-            embeddings.append(embedding)
-
-            contents.append(text.page_content)
-            sources.append("pdf")
-        assert len(ids) == len(embeddings) == len(sources) == len(contents), "字段长度不一致！"
-        print(f"ID数量: {len(ids)}")
-        print(f"向量数量: {len(embeddings)}")
-        print(f"单个向量维度: {len(embeddings[0])}")
-        data = [
-            ids,
-            embeddings,
-            sources,
-            [" "] * len(ids),
-            [0]*len(ids),
-            [""]*len(ids),
-            contents
-        ]
-        collection.insert(data)
+            schema = collection.schema
+            for field in schema.fields:
+                if field.dtype == DataType.FLOAT_VECTOR:
+                    print(f"向量字段 '{field.name}' 的维度: {field.params['dim']}")
+            
+            # 按Schema字段顺序组织
+            insert_data = [
+                data["ids"],
+                data["embeddings"],  # 注意这里是二维列表
+                data["sources"],
+                data["user_ids"],
+                data["ratings"],
+                data["timestamps"],
+                data["contents"]
+            ]
+            collection.insert(insert_data)
         collection.flush()
+        print(f"共插入: {len(texts)} 数据")
 
     def load_pdf2(self, pdf_path, merge_to_existing=True):
         # 1 层 检索层 Retrieval, 检索增强 RAG ，包括documents loaders、text splitters、vector stores、retrievers等组件
@@ -218,8 +250,6 @@ class PDFQAAgent:
         # 3 层，链式层,Chains
 
     def add_feedback(self, feedback: dict):
-        if not self.collection:
-            raise ValueError("collection is required")
         # 生成反馈内容的向量
         embedding = self.embeddings.embed_query(feedback["content"])
 
@@ -245,20 +275,73 @@ class PDFQAAgent:
         elif "如何" in question:
             question = f"请分步骤说明：{question}"
         question_embedding = self.embeddings.embed_query(question)
-        expr = None
-        results = self.vectorstore.search(
-            embedding=question_embedding,
-            expr=None,
-            output_fields=["content", "source_type", "user_id"]
+        keywords = self._extrace_keywords(question)
+        # conditions = []
+        # if keywords:
+        #     for kw in keywords:
+        #         conditions.append(f"text like '{kw.lower().strip(".,!?")}%'")
+        #         break
+        # expr = " OR ".join(conditions) if conditions else None
+        expr = f"text like '{keywords[0].lower().strip(".,!?")}%'" if keywords else None
+        # results = self.vectorstore.search(
+        #     question_embedding,
+        #     "similarity",
+        #     # output_fields=["content", "source_type", "user_id"]
+        # )
+        collection = Collection(self.current_collection)
+        collection.load()
+        print(f"集合行数: {collection.num_entities}")
+        print(f"集合字段: {collection.schema}")
+        _res = collection.query(expr='source_type == "pdf"', output_fields=["content"], limit=1)
+        print(f"插入的原始数据示例: {_res}")
+        print(f"关键字： {expr}")
+        results1 = collection.search(
+            [question_embedding],
+            "vector",
+            {
+                "metric_type": "L2",
+                "params": {"nprobe": 16},
+            },
+            5,
+            expr=expr,
+            output_fields=["text", "source_type", "user_id"]
+        )
+        results2 = collection.search(
+            [question_embedding],
+            "vector",
+            {
+                "metric_type": "L2",
+                "params": {"nprobe": 16},
+            },
+            5,
+            output_fields=["text", "source_type", "user_id"]
         )
         # return self.qa.run(question)
         # 组装上下文供LLM生成答案
-        context = "\n\n".join([
-            f"[来源: {hit.entity.get('source_type')}, 用户: {hit.entity.get('user_id')}]\n{hit.entity.get('content')}"
-            for hit in results
-        ])
-
-        return self.llm(f"根据以下信息回答问题：\n{context}\n\n问题：{question}")
+        # context = "\n\n".join([
+        #     f"[来源: {hit.entity.get('source_type')}, 用户: {hit.entity.get('user_id')}]\n{hit.entity.get('content')}"
+        #     for hit in results
+        # ])
+        res = []
+        for hits in results1:
+            for hit in hits:
+                entity = hit.entity
+                res.append(
+                    f"[来源: {entity.get('source_type')}, 用户: {entity.get('user_id')}]\n{entity.get('text')}"
+                )
+        for hits in results2:
+            for hit in hits:
+                entity = hit.entity
+                res.append(
+                    f"[来源: {entity.get('source_type')}, 用户: {entity.get('user_id')}]\n{entity.get('text')}"
+                )
+        context = "\n\n".join(res)
+        print("上下文: ", res)
+        # return self.llm(f"根据以下信息回答问题：\n{context}\n\n问题：{question}")
+        answer = self.llm(
+            self.qa_prompt.format(context=context, keywords=keywords, question=f"问题: {question}\n请根据上下文用中文回答;")
+        )
+        return answer
     
     def summarize(self):
         return self.qa.run("请用中文总结这篇文档的主要内容.")

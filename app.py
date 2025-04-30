@@ -34,8 +34,8 @@ class Knownledge(BaseModel):
     feedback_id: str
     user_id: str
     content: str
-    rating: int
-    timestamp: str
+    rating: int = 0
+    timestamp: str = ""
 
 @app.post("/api/answers")
 async def gen_answers(question: Question):
@@ -45,7 +45,7 @@ async def gen_answers(question: Question):
 
 @app.post("/api/qa_knownledge1")
 async def create_knownledge(knownledge: Knownledge):
-    qa_agent.add_feedback(knownledge)
+    qa_agent.add_feedback(knownledge.model_dump())
     return {"ok": True}
 
 @app.post("/api/upload")
@@ -83,4 +83,4 @@ async def get_analysis():
 
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", reload=True)
+    uvicorn.run("app:app", port=8001, reload=False)
