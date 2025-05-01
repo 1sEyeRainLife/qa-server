@@ -3,7 +3,7 @@ from pymilvus import connections, Collection, CollectionSchema, FieldSchema, Dat
 
 fields = [
     FieldSchema(name="id", dtype=DataType.VARCHAR, is_primary=True, max_length=64),
-    FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=3072),  # 向量，执行 page.tolist()
+    FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=768),  # 向量，执行 page.tolist()
     FieldSchema(name="source_type", dtype=DataType.VARCHAR, max_length=32),  # pdf或者feedback
     FieldSchema(name="user_id", dtype=DataType.VARCHAR, max_length=64),
     FieldSchema(name="rating", dtype=DataType.INT64),

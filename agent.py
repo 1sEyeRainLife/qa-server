@@ -26,10 +26,12 @@ QA_PROMPT_TEMPLATE = """你是一位专业的技术文档分析师，请根据�
 3. 确实无关时再说"我不知道"
 
 上下文：{context}
+关键词：{keywords}
 问题：{question}
-关键词：{keywords}  # 显式提示LLM关注这些词
 答案（简洁中文）：
 """
+
+# 关键词：{keywords}  # 显式提示LLM关注这些词
 # 提示词优化技巧
 # 在提示词中指定AI的角色，例如： 你是以为技术文档专家，请回答与i下问题。。。
 # 明确输出的格式，如列表，json等
@@ -48,24 +50,23 @@ class PDFQAAgent:
         # 本地大模型
         self.llm = Ollama(model=self.model_name, temperature=0.7)
 
-        self.embeddings = OllamaEmbeddings(model=self.model_name)
+        self.embeddings = OllamaEmbeddings(model="quentinz/bge-base-zh-v1.5")
         # 2 层 记忆层 Memory，包括短期记忆和长期记忆
         self.memory = ConversationBufferWindowMemory(
             k=5,
             memory_key="history",
-            return_messages=True,
-            output_key=None
+            return_messages=True
         )
 
         self.qa_prompt = PromptTemplate(
             template=QA_PROMPT_TEMPLATE,
-            input_variables=["context", "question"]
+            input_variables=["context", "keywords", "question"]
         )
 
         self.vectorstore = None
         self.qa = None
         self.qa_chains: Dict[str, RetrievalQA] = {}
-        self.current_collection = "qa_knownledge4"
+        self.current_collection = "qa_knownledge5"
         if self.persist_db:
             self._init_milvus_connection()
             self._load_existing_collections()
@@ -107,12 +108,8 @@ class PDFQAAgent:
                 llm=self.llm,
                 chain_type="stuff",
                 retriever=self.vectorstore.as_retriever(),
-                memory=ConversationBufferWindowMemory(
-                    k=5,
-                    memory_key="history",
-                    return_messages=True,
-                    output_key=None
-                ),
+                input_key="question",
+                # memory=self.memory,
                 chain_type_kwargs={"prompt": self.qa_prompt}
             )
         # collections = utility.list_collections()
@@ -234,12 +231,7 @@ class PDFQAAgent:
                 llm=self.llm,
                 chain_type="stuff",
                 retriever=vectorstore.as_retriever(),
-                memory=ConversationBufferWindowMemory(
-                        k=5,
-                        memory_key="history",
-                        return_messages=True,
-                        output_key=None
-                    ),
+                memory=self.memory,
                 chain_type_kwargs={"prompt": self.qa_prompt}
             )
             # FAISS内存存储向量数据
@@ -341,6 +333,12 @@ class PDFQAAgent:
         answer = self.llm(
             self.qa_prompt.format(context=context, keywords=keywords, question=f"问题: {question}\n请根据上下文用中文回答;")
         )
+        # answer = self.qa.run(
+        #     context=context,
+        #     keywords=",".join(keywords),
+        #     question=question
+        # )
+        # answer = self.qa.run(question)
         return answer
     
     def summarize(self):
