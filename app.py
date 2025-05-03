@@ -4,10 +4,11 @@ from dotenv import load_dotenv
 load_dotenv()
 import asyncio
 import json
+from redis import asyncio as aioredis
 from datetime import datetime
 from pathlib import Path
-
-from fastapi import FastAPI, UploadFile, File, Request
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, UploadFile, File, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
@@ -15,6 +16,23 @@ from pydantic import BaseModel
 from agent import PDFQAAgent
 from chat import chat
 from _agent import agent as tool_agent
+
+ask_queue = asyncio.Queue(maxsize=1024)
+
+redis_conn = None
+
+async def queue_worker():
+    while True:
+        print("开始获取消息...")
+        item = await ask_queue.get()
+        print("获取到消息，开始处理。。。")
+        sid = item.get("sid")
+        question = item.get("question")
+        # for m in chat(sid, question):
+        #     res = json.dumps({"question": question, "answer": m}, ensure_ascii=False)
+        #     redis_conn.publish(f"sse:{sid}", res)
+        res = json.dumps({"question": question, "answer": question}, ensure_ascii=False)
+        await redis_conn.publish(f"sse:{sid}", res)
 
 
 app = FastAPI()
@@ -44,14 +62,49 @@ class Knownledge(BaseModel):
     rating: int = 0
     timestamp: str = ""
 
+@app.on_event("startup")
+async def startup():
+    global redis_conn
+    redis_conn = await aioredis.from_url("redis://localhost:6379/0", encoding="utf-8", decode_responses=True)
+    asyncio.create_task(queue_worker())
+
+
+@app.get("/stream")
+async def stream(token: str, sid: str):
+    # TODO token 验证
+    print(f"来者何人：{sid}")
+    pubsub = redis_conn.pubsub()
+    await pubsub.subscribe(f"sse:{sid}")
+
+    async def event_message():
+        async for answer in pubsub.listen():
+            print("监听到消息了...", answer)
+            if answer["type"] == "message":
+                yield f"event: new_answer\ndata: {answer['data']}\n\n"
+            # yield {
+            #     "event": "new_answer",
+            #     "data": answer
+            # }
+
+    return StreamingResponse(
+        event_message(),
+        media_type="text/event-stream"
+    )
+
+
 @app.post("/api/chat")
-async def get_chat(question: Question):
-    message = chat(question.text)
-    qa_history.append({
-        "question": question.text,
-        "answer": message
-    })
-    return {"message": message}
+async def get_chat(token: str, sid: str, question: Question):
+    # message = chat(question.text)
+    # qa_history.append({
+    #     "question": question.text,
+    #     "answer": message
+    # })
+    print("来者何人sid: ", sid)
+    await ask_queue.put({"sid": sid, "question": question.text})
+    # await redis_conn.publish(f"sse:{sid}", question.text)
+    print("done")
+    return {"ok": True}
+
 
 @app.post("/api/tool/agent")
 async def get_tool_agent(question: Question):
@@ -116,12 +169,8 @@ async def event_generator(uid: str, qwen: str):
 
         await asyncio.sleep(1)
 
-@app.get("/stream")
-async def stream(uid: str, model: str):
-    return StreamingResponse(
-        event_generator(uid, model),
-        media_type="text/event-stream"
-    )
+
+
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
@@ -130,8 +179,10 @@ async def read_root(request: Request):
         "title": "hello",
         "message": "h"
     }
-    return templates.TemplateResponse("index.html", context)
+    return templates.TemplateResponse("index2.html", context)
+
+
 
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", port=8001, reload=False)
+    uvicorn.run("app:app", host="0.0.0.0", port=8001, reload=False)
