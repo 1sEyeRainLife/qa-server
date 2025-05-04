@@ -28,10 +28,11 @@ async def queue_worker():
         print("获取到消息，开始处理。。。")
         sid = item.get("sid")
         question = item.get("question")
-        # for m in chat(sid, question):
-        #     res = json.dumps({"question": question, "answer": m}, ensure_ascii=False)
-        #     redis_conn.publish(f"sse:{sid}", res)
-        res = json.dumps({"question": question, "answer": question}, ensure_ascii=False)
+        async for m in chat(sid, question):
+            res = json.dumps({"question": question, "answer": m}, ensure_ascii=False)
+            await redis_conn.publish(f"sse:{sid}", res)
+
+        res = json.dumps({"question": question, "answer": "[DONE]"}, ensure_ascii=False)
         await redis_conn.publish(f"sse:{sid}", res)
 
 
