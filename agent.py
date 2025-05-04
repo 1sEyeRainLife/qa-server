@@ -6,7 +6,7 @@ import jieba.posseg as pseg
 from typing import Dict
 from dotenv import load_dotenv
 from datetime import datetime
-from pymilvus import utility, connections, Collection, DataType
+from pymilvus import utility, connections, Collection, DataType, WeightedRanker, RRFRanker, AnnSearchRequest
 from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import FAISS, Milvus
@@ -15,6 +15,7 @@ from langchain.chains import RetrievalQA
 from langchain.llms import Ollama
 from langchain.memory import ConversationBufferMemory, ConversationBufferWindowMemory
 from langchain.prompts import PromptTemplate
+from elasticsearch import Elasticsearch
 from models import schema as collection_schema
 
 load_dotenv()
@@ -27,6 +28,7 @@ QA_PROMPT_TEMPLATE = """你是一位专业的技术文档分析师，请根据�
 
 上下文：{context}
 关键词：{keywords}
+历史记录: {history}
 问题：{question}
 答案（简洁中文）：
 """
@@ -52,24 +54,18 @@ class PDFQAAgent:
 
         self.embeddings = OllamaEmbeddings(model="quentinz/bge-base-zh-v1.5")
         # 2 层 记忆层 Memory，包括短期记忆和长期记忆
-        self.memory = ConversationBufferWindowMemory(
-            k=5,
-            memory_key="history",
-            return_messages=True
-        )
+        self.memory = ConversationBufferWindowMemory()
 
         self.qa_prompt = PromptTemplate(
             template=QA_PROMPT_TEMPLATE,
-            input_variables=["context", "keywords", "question"]
+            input_variables=["context", "keywords", "history", "question"]
         )
 
         self.vectorstore = None
-        self.qa = None
-        self.qa_chains: Dict[str, RetrievalQA] = {}
         self.current_collection = "qa_knownledge5"
         if self.persist_db:
             self._init_milvus_connection()
-            self._load_existing_collections()
+            # self._load_existing_collections()
     
     def _extrace_keywords(self, text):
         words = pseg.cut(text)
@@ -112,28 +108,6 @@ class PDFQAAgent:
                 # memory=self.memory,
                 chain_type_kwargs={"prompt": self.qa_prompt}
             )
-        # collections = utility.list_collections()
-        # pdf_collections = [col for col in collections if col.startswith("pdf_")]
-        # for col_name in pdf_collections:
-        #     print(f"加载已有集合: {col_name}")
-        #     vectorstore = Milvus(
-        #         embedding_function=self.embeddings,
-        #         collection_name=col_name,
-        #         connection_args={"host": "127.0.0.1", "port": "19530"}
-        #     )
-        #     self.qa_chains[col_name] = RetrievalQA.from_chain_type(
-        #         llm=self.llm,
-        #         chain_type="stuff",
-        #         retriever=vectorstore.as_retriever(),
-        #         memory=ConversationBufferWindowMemory(
-        #             k=5,
-        #             memory_key="history",
-        #             return_messages=True,
-        #             output_key=None
-        #         ),
-        #         chain_type_kwargs={"prompt": self.qa_prompt}
-        #     )
-        #     self.current_collection = col_name
     
     def load_pdf(self, pdf_path, merge_to_existing=True):
         print("准备加载pdf")
@@ -259,79 +233,180 @@ class PDFQAAgent:
         collection.insert(data)
         print("反馈已添加")
     
-    def ask(self, question, collection_name=None):
-        target_collection = collection_name or self.current_collection
-        # 动态调整提示词：
-        if "是什么" in question:
-            question = f"请用通俗易懂的语言解释：{question}"
-        elif "如何" in question:
-            question = f"请分步骤说明：{question}"
+    def retrieval_bm25(self, question):
+        """BM25关键词召回
+        基于关键词的BM25相似性的搜索策略
+        bm25也是es的默认搜索策略
+        BM25 是一种基于统计概率的文本相似度算法，考虑了词频TF、逆文档率IDF和文档长度归一化
+        提高检索精度，特定领域关键词丢失问题
+        """
+        # Whoosh（纯Python搜索引擎，支持BM25）
+        # 分词或不分词都可以
+        es = Elasticsearch("http://localhost:9200")
+        # es.index(index="knowledge", id=doc[id], body={"text": doc[text]})  插入一个doc
+        q = {
+            "query": {
+                "match": {
+                    "text": {"query": "hello"}  # ik_smart中文分词，基于jieba
+                }
+            },
+            "size": 5
+        }
+        res = es.search(
+            index="knowledge",
+            body=q
+        )
+        print("="*50)
+        print(res)
+        hits = {hit["_id"]: hit["_source"]["text"] for hit in res["hits"]["hits"]}
+        scores = np.array([hit["_score"] for hit in res["hits"]["hits"]])
+        return (hits, scores)
+    
+    def retrieval_milvus(self, question):
+        """向量语义找回
+        基于向量相似度的查询，milvus的IVF_FLAT索引，平衡性能与准确度
+        相似度衡量设置为COSIN,基于内积与长度的比值，所以与向量的长度不敏感
+        如果直接使用内积比较相似性，则与向量的长度相关
+
+        IVF_PQ索引，对向量进行乘机压缩，适用于内存敏感场景
+
+        HNSW场景适用于千万级向量检索，召回率高达90%
+        """
         question_embedding = self.embeddings.embed_query(question)
         keywords = self._extrace_keywords(question)
-        # conditions = []
-        # if keywords:
-        #     for kw in keywords:
-        #         conditions.append(f"text like '{kw.lower().strip(".,!?")}%'")
-        #         break
-        # expr = " OR ".join(conditions) if conditions else None
-        expr = f"text like '{keywords[0].lower().strip(".,!?")}%'" if keywords else None
-        # results = self.vectorstore.search(
-        #     question_embedding,
-        #     "similarity",
-        #     # output_fields=["content", "source_type", "user_id"]
-        # )
         collection = Collection(self.current_collection)
         collection.load()
         print(f"集合行数: {collection.num_entities}")
         print(f"集合字段: {collection.schema}")
         _res = collection.query(expr='source_type == "pdf"', output_fields=["content"], limit=1)
         print(f"插入的原始数据示例: {_res}")
+        expr = f"text like '{keywords[0].lower().strip(".,!?")}%'" if keywords else None
         print(f"关键字： {expr}")
-        results1 = collection.search(
+        # results1 = collection.search(
+        #     [question_embedding],
+        #     "vector",
+        #     {
+        #         "metric_type": "L2",
+        #         "params": {"nprobe": 16},
+        #     },
+        #     5,
+        #     expr=expr,  # 这里是标签过滤
+        #     output_fields=["text", "source_type", "user_id"]
+        # )
+        # results1 = AnnSearchRequest(**{
+        #     "data": [question_embedding],
+        #     "anns_field": "vector",
+        #     "param": {"metric_type": "L2", "params": {"nprobe": 16}},
+        #     "limit": 5,
+        #     "expr": expr
+        # })
+        results = collection.search(
             [question_embedding],
             "vector",
             {
                 "metric_type": "L2",
-                "params": {"nprobe": 16},
-            },
-            5,
-            expr=expr,
-            output_fields=["text", "source_type", "user_id"]
-        )
-        results2 = collection.search(
-            [question_embedding],
-            "vector",
-            {
-                "metric_type": "L2",
-                "params": {"nprobe": 16},
+                "params": {"nprobe": 16},  # 平衡精度与速度
             },
             5,
             output_fields=["text", "source_type", "user_id"]
         )
-        # return self.qa.run(question)
-        # 组装上下文供LLM生成答案
-        # context = "\n\n".join([
-        #     f"[来源: {hit.entity.get('source_type')}, 用户: {hit.entity.get('user_id')}]\n{hit.entity.get('content')}"
-        #     for hit in results
-        # ])
-        res = []
-        for hits in results1:
-            for hit in hits:
-                entity = hit.entity
-                res.append(
-                    f"[来源: {entity.get('source_type')}, 用户: {entity.get('user_id')}]\n{entity.get('text')}"
-                )
-        for hits in results2:
-            for hit in hits:
-                entity = hit.entity
-                res.append(
-                    f"[来源: {entity.get('source_type')}, 用户: {entity.get('user_id')}]\n{entity.get('text')}"
-                )
-        context = "\n\n".join(res)
+        # results2 = AnnSearchRequest(**{
+        #     "data": [question_embedding],
+        #     "anns_field": "vector",
+        #     "param": {"metric_type": "L2", "params": {"nprobe": 16}},
+        #     "limit": 5
+        # })
+        # collections. 融合重排序  
+        # 0.2, 0.5
+        # reqs = [results1, results2]
+        # ranker = WeightedRanker(0.2, 0.5)
+        # hybrid_res = collection.hybrid_search(reqs, ranker, limit=5, output_fields=["text", "source_type", "user_id"])
+        hits = {hit.id: hit.entity.get("text") for hit in results[0]}
+        scores = np.array(hit.distance for hit in results[0])  # 转换距离为相似度
+        # ES的BM25分数和milvus的距离分数需要反向处理，距离越小越相关
+        return (hits, scores)
+    
+    def normalize_scores(self, scores):
+        """Min-Max标准化到[0,1]范围"""
+        min_val = np.min(scores)
+        max_val = np.max(scores)
+        return (scores-min_val) / (max_val - min_val + 1e-6)  # 避免除0
+    
+    def hybrid_score(self, bm25_scores, vector_scores, bm25_weight=0.3):
+        """线性加权融合"""
+        combined = bm25_weight * bm25_scores + (1-bm25_weight) * vector_scores
+        return combined
+    
+    def rrf_hybrid(self, bm25_ranks, vector_ranks, k=60):
+        """RRF 倒数排序融合"""
+        scores = {}
+        for doc_id in set(bm25_ranks + vector_ranks):
+            rank_bm25 = bm25_ranks.index(doc_id) + 1 if doc_id in bm25_ranks else k
+            rank_vector = vector_ranks.index(doc_id) + 1 if doc_id in vector_ranks else k
+            scores[doc_id] = 1/(rank_bm25+k) + 1/(rank_vector+k)
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    
+    def hybrid_rank(self, bm25_res, vector_res):
+        """基于权重的融合排序"""
+        print("-"*100)
+        print(vector_res)
+        bm25_hits, bm25_scores = bm25_res
+        vector_hits, vector_scores = vector_res
+        all_doc_ids = list(set(bm25_hits.keys()).union(set(vector_hits.keys())))
+
+        # 分数标准化与填充
+        def fill_scores(hits, all_ids, original_scores):
+            scores = np.zeros(len(all_ids))
+            for i, doc_id in enumerate(all_ids):
+                if doc_id in hits:
+                    scores[i] = original_scores[list(hits.keys()).index(doc_id)]
+            return self.normalize_scores(scores)
+    
+        bm25_norm = fill_scores(bm25_hits, all_doc_ids, bm25_scores)
+        vector_norm = fill_scores(vector_hits, all_doc_ids, vector_scores)
+        # 加权融合
+        combined_scores = self.hybrid_score(bm25_norm, vector_norm, 0.3)
+        ranked_indices = np.argsort(combined_scores)[::-1]  # 倒叙
+        results = []
+        for idx in ranked_indices:
+            doc_id = all_doc_ids[idx]
+            source = "BM25" if doc_id in bm25_hits else "Vector"
+            if doc_id in bm25_hits and doc_id in vector_hits:
+                source = "Both"
+            results.append({
+                "rank": len(results)+1,
+                "doc_id": doc_id,
+                "source": source,
+                "score": combined_scores[idx],
+                "text": bm25_hits.get(doc_id) or vector_hits.get(doc_id)
+            })
+        return results
+
+    def ask(self, question):
+        bm25_res = self.retrieval_bm25(question)
+        vector_res = self.retrieval_milvus(question)
+
+        res = self.hybrid_rank(bm25_res, vector_res)
+        
+        context = "\n\n".join([r['text'] for r in res])
         print("上下文: ", res)
         # return self.llm(f"根据以下信息回答问题：\n{context}\n\n问题：{question}")
+        
+        # 动态调整提示词：
+        if "是什么" in question:
+            question = f"请用通俗易懂的语言解释：{question}"
+        elif "如何" in question:
+            question = f"请分步骤说明：{question}"
+        
+        keywords = self._extrace_keywords(question)
+        history = self.memory.load_memory_variables({})
+    
         answer = self.llm(
-            self.qa_prompt.format(context=context, keywords=keywords, question=f"问题: {question}\n请根据上下文用中文回答;")
+            self.qa_prompt.format(
+                context=context,
+                keywords=keywords,
+                history=history.get("history", ""),
+                question=f"问题: {question}\n请根据上下文用中文回答;")
         )
         # answer = self.qa.run(
         #     context=context,
@@ -340,12 +415,6 @@ class PDFQAAgent:
         # )
         # answer = self.qa.run(question)
         return answer
-    
-    def summarize(self):
-        return self.qa.run("请用中文总结这篇文档的主要内容.")
-    
-    def extract_key_info(self):
-        return self.qa.run("从文档中提取关键信息，如人名、日期、重要数据等.")
     
     def clear_memory(self):
         self.memory.clear()
