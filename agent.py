@@ -247,18 +247,18 @@ class PDFQAAgent:
         q = {
             "query": {
                 "match": {
-                    "text": {"query": "hello"}  # ik_smart中文分词，基于jieba
+                    "content": question  # ik_smart中文分词，基于jieba
                 }
             },
             "size": 5
         }
         res = es.search(
-            index="knowledge",
+            index="knowledge1",
             body=q
         )
-        print("="*50)
-        print(res)
-        hits = {hit["_id"]: hit["_source"]["text"] for hit in res["hits"]["hits"]}
+        # print("="*50)
+        # print(res)
+        hits = {hit["_id"]: hit["_source"]["content"] for hit in res["hits"]["hits"]}
         scores = np.array([hit["_score"] for hit in res["hits"]["hits"]])
         return (hits, scores)
     
@@ -322,7 +322,7 @@ class PDFQAAgent:
         # ranker = WeightedRanker(0.2, 0.5)
         # hybrid_res = collection.hybrid_search(reqs, ranker, limit=5, output_fields=["text", "source_type", "user_id"])
         hits = {hit.id: hit.entity.get("text") for hit in results[0]}
-        scores = np.array(hit.distance for hit in results[0])  # 转换距离为相似度
+        scores = np.array([1/hit.distance for hit in results[0]])  # 转换距离为相似度
         # ES的BM25分数和milvus的距离分数需要反向处理，距离越小越相关
         return (hits, scores)
     
@@ -348,8 +348,8 @@ class PDFQAAgent:
     
     def hybrid_rank(self, bm25_res, vector_res):
         """基于权重的融合排序"""
-        print("-"*100)
-        print(vector_res)
+        # print("-"*100)
+        # print(vector_res)
         bm25_hits, bm25_scores = bm25_res
         vector_hits, vector_scores = vector_res
         all_doc_ids = list(set(bm25_hits.keys()).union(set(vector_hits.keys())))
@@ -359,7 +359,10 @@ class PDFQAAgent:
             scores = np.zeros(len(all_ids))
             for i, doc_id in enumerate(all_ids):
                 if doc_id in hits:
-                    scores[i] = original_scores[list(hits.keys()).index(doc_id)]
+                    idx = list(hits.keys()).index(doc_id)
+                    # print(">"*50, original_scores)
+                    # print(">"*50, idx)
+                    scores[i] = original_scores[idx]
             return self.normalize_scores(scores)
     
         bm25_norm = fill_scores(bm25_hits, all_doc_ids, bm25_scores)
@@ -381,12 +384,23 @@ class PDFQAAgent:
                 "text": bm25_hits.get(doc_id) or vector_hits.get(doc_id)
             })
         return results
+    
+    def retrieval_hybrid(self, question):
+        bm25_docs, _ = self.retrieval_bm25(question)
+        vector_docs, _ = self.retrieval_milvus(question)
+        bm25_docs.update(vector_docs)
+        return bm25_docs, "test"
 
     def ask(self, question):
         bm25_res = self.retrieval_bm25(question)
         vector_res = self.retrieval_milvus(question)
 
+        # 融合排序
         res = self.hybrid_rank(bm25_res, vector_res)
+        # bm25_res[0] = {hit.id: hit.entity.get("text") for hit in results[0]}
+
+        # 向量
+        # res = [{"text": v} for k, v in bm25_res[0].items()]
         
         context = "\n\n".join([r['text'] for r in res])
         print("上下文: ", res)
