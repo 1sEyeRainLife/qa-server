@@ -30,8 +30,9 @@ QA_PROMPT_TEMPLATE = """你是一位专业的技术文档分析师，请根据�
 关键词：{keywords}
 历史记录: {history}
 问题：{question}
-答案（简洁中文）：
 """
+# 答案（简洁中文）：
+
 
 # 关键词：{keywords}  # 显式提示LLM关注这些词
 # 提示词优化技巧
@@ -390,27 +391,39 @@ class PDFQAAgent:
         vector_docs, _ = self.retrieval_milvus(question)
         bm25_docs.update(vector_docs)
         return bm25_docs, "test"
+    
+    def rewrite(self, question):
+        # 1. 错别字纠正
+        # 2. 规则：电脑
 
-    def ask(self, question):
-        bm25_res = self.retrieval_bm25(question)
-        vector_res = self.retrieval_milvus(question)
-
-        # 融合排序
-        res = self.hybrid_rank(bm25_res, vector_res)
-        # bm25_res[0] = {hit.id: hit.entity.get("text") for hit in results[0]}
-
-        # 向量
-        # res = [{"text": v} for k, v in bm25_res[0].items()]
-        
-        context = "\n\n".join([r['text'] for r in res])
-        print("上下文: ", res)
-        # return self.llm(f"根据以下信息回答问题：\n{context}\n\n问题：{question}")
+        # 3 few-shot, llama2系列，做
         
         # 动态调整提示词：
         if "是什么" in question:
             question = f"请用通俗易懂的语言解释：{question}"
         elif "如何" in question:
             question = f"请分步骤说明：{question}"
+        return question
+
+    def ask(self, question, recall=""):
+        # 基于规则与few-shot的查询改写
+        question = self.rewrite(question)
+
+        if not recall:
+            bm25_res = self.retrieval_bm25(question)
+            vector_res = self.retrieval_milvus(question)
+
+            # 融合排序
+            res = self.hybrid_rank(bm25_res, vector_res)
+        elif recall == "vector":
+            vector_res = self.retrieval_milvus(question)
+                    # 向量
+            res = [{"text": v} for k, v in vector_res[0].items()]
+        # bm25_res[0] = {hit.id: hit.entity.get("text") for hit in results[0]}
+        
+        context = "\n\n".join([r['text'] for r in res])
+        print("上下文: ", res)
+        # return self.llm(f"根据以下信息回答问题：\n{context}\n\n问题：{question}")
         
         keywords = self._extrace_keywords(question)
         history = self.memory.load_memory_variables({})
